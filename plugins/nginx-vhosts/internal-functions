@@ -1,0 +1,224 @@
+#!/usr/bin/env bash
+set -eo pipefail
+[[ $DOKKU_TRACE ]] && set -x
+source "$PLUGIN_CORE_AVAILABLE_PATH/common/functions"
+source "$PLUGIN_CORE_AVAILABLE_PATH/common/property-functions"
+
+fn-nginx-vhosts-last-visited-at() {
+  declare APP="$1"
+  local LOG_PATH=$(fn-nginx-access-log-path "$APP")
+
+  if [[ "$LOG_PATH" != "off" ]] && [[ "$LOG_PATH" != "/dev/null" ]] && [[ -f "$LOG_PATH" ]]; then
+    stat -c %Y "$LOG_PATH"
+  fi
+}
+
+fn-nginx-hsts-include-subdomains() {
+  declare APP="$1"
+  fn-plugin-property-get-default "nginx" "$APP" "hsts-include-subdomains" "true"
+}
+
+fn-nginx-hsts-max-age() {
+  declare APP="$1"
+  fn-plugin-property-get-default "nginx" "$APP" "hsts-max-age" "15724800"
+}
+
+fn-nginx-hsts-preload() {
+  declare APP="$1"
+  fn-plugin-property-get-default "nginx" "$APP" "hsts-preload" "false"
+}
+
+fn-nginx-hsts-is-enabled() {
+  declare APP="$1"
+  local hsts_is_enabled="$(fn-plugin-property-get-default "nginx" "$APP" "hsts" "")"
+
+  if [[ "$hsts_is_enabled" == "" ]]; then
+    hsts_is_enabled="$(fn-plugin-property-get-default "nginx" "--global" "hsts" "true")"
+  fi
+
+  echo "$hsts_is_enabled"
+}
+
+fn-nginx-computed-nginx-conf-sigil-path() {
+  declare APP="$1"
+  local conf_sigil_path="$(fn-nginx-nginx-conf-sigil-path "$APP")"
+
+  if [[ "$conf_sigil_path" == "" ]]; then
+    conf_sigil_path="$(fn-nginx-global-nginx-conf-sigil-path)"
+  fi
+
+  echo "$conf_sigil_path"
+}
+
+fn-nginx-global-nginx-conf-sigil-path() {
+  declare APP="$1"
+
+  fn-plugin-property-get-default "nginx" "--global" "nginx-conf-sigil-path" "nginx.conf.sigil"
+}
+
+fn-nginx-nginx-conf-sigil-path() {
+  declare APP="$1"
+  fn-plugin-property-get-default "nginx" "$APP" "nginx-conf-sigil-path" ""
+}
+
+fn-nginx-vhosts-manage-hsts() {
+  declare APP="$1" SSL_ENABLED="$2"
+  local HSTS="$(fn-nginx-hsts-is-enabled "$APP")"
+  local HSTS_INCLUDE_SUBDOMAINS="$(fn-nginx-hsts-include-subdomains "$APP")"
+  local HSTS_MAX_AGE="$(fn-nginx-hsts-max-age "$APP")"
+  local HSTS_PRELOAD="$(fn-nginx-hsts-preload "$APP")"
+  local NGINX_HSTS_CONF="$DOKKU_ROOT/$APP/nginx.conf.d/hsts.conf"
+  local HSTS_TEMPLATE="$PLUGIN_AVAILABLE_PATH/nginx-vhosts/templates/hsts.conf.sigil"
+
+  CUSTOM_HSTS_TEMPLATE="$(plugn trigger nginx-app-template-source "$APP" "hsts-config")"
+  if [[ -n "$CUSTOM_HSTS_TEMPLATE" ]]; then
+    HSTS_TEMPLATE="$CUSTOM_HSTS_TEMPLATE"
+  fi
+
+  if [[ "$HSTS" == "false" ]] || [[ "$SSL_ENABLED" != "true" ]]; then
+    rm -rf "$NGINX_HSTS_CONF"
+    return
+  fi
+
+  dokku_log_verbose_quiet "Enabling HSTS"
+  local HSTS_HEADERS=""
+  if [[ -n "$HSTS_MAX_AGE" ]]; then
+    HSTS_HEADERS="max-age=$HSTS_MAX_AGE"
+  fi
+
+  if [[ "$HSTS_INCLUDE_SUBDOMAINS" == "true" ]]; then
+    HSTS_HEADERS+="; includeSubdomains"
+  fi
+
+  if [[ "$HSTS_PRELOAD" == "true" ]]; then
+    HSTS_HEADERS+="; preload"
+  fi
+
+  mkdir -p "$DOKKU_ROOT/$APP/nginx.conf.d"
+  sigil -f "$HSTS_TEMPLATE" HSTS_HEADERS="$HSTS_HEADERS" | cat -s >"$NGINX_HSTS_CONF"
+}
+
+fn-nginx-vhosts-uses-openresty() {
+  declare desc="returns whether openresty is in use or not"
+
+  if [[ -x /usr/bin/openresty ]]; then
+    return
+  fi
+
+  return 1
+}
+
+fn-nginx-vhosts-nginx-location() {
+  declare desc="check that nginx is at the expected location and return it"
+  local NGINX_LOCATION
+
+  NGINX_LOCATION=$(command -v nginx 2>/dev/null)
+  if [[ -z "$NGINX_LOCATION" ]]; then
+    NGINX_LOCATION="/usr/sbin/nginx"
+  fi
+
+  if fn-nginx-vhosts-uses-openresty; then
+    NGINX_LOCATION="/usr/bin/openresty"
+  fi
+
+  if [[ ! -x "$NGINX_LOCATION" ]]; then
+    dokku_log_fail "Could not find nginx binary in \$PATH or at '${NGINX_LOCATION}'."
+  fi
+
+  echo "$NGINX_LOCATION"
+}
+
+fn-nginx-vhosts-nginx-init-cmd() {
+  declare desc="start nginx for given distros"
+  declare CMD="$1"
+  local NGINX_INIT_NAME
+
+  NGINX_INIT_NAME=nginx
+  if fn-nginx-vhosts-uses-openresty; then
+    NGINX_INIT_NAME=openresty
+  fi
+
+  case "$DOKKU_DISTRO" in
+    debian | raspbian)
+      if [[ -x /usr/bin/systemctl ]]; then
+        sudo /usr/bin/systemctl "$CMD" "$NGINX_INIT_NAME"
+      else
+        sudo /usr/sbin/invoke-rc.d "$NGINX_INIT_NAME" "$CMD"
+      fi
+      ;;
+
+    ubuntu)
+      # support docker-based installations
+      if [[ -x /usr/bin/sv ]]; then
+        sudo /usr/bin/sv "$CMD" "$NGINX_INIT_NAME"
+      elif [[ -x /usr/bin/systemctl ]]; then
+        sudo /usr/bin/systemctl "$CMD" "$NGINX_INIT_NAME"
+      elif [[ "$CMD" == "enable" ]] || [[ "$CMD" == "disable" ]]; then
+        dokku_log_warn "Running $CMD is not possible for init.d managed services"
+      else
+        sudo "/etc/init.d/$NGINX_INIT_NAME" "$CMD"
+      fi
+      ;;
+
+    arch)
+      sudo /usr/bin/systemctl "$CMD" "$NGINX_INIT_NAME"
+      ;;
+  esac
+}
+
+fn-get-pagesize() {
+  declare desc="return the underlying system's memory page size"
+
+  "$PLUGIN_CORE_AVAILABLE_PATH/nginx-vhosts/pagesize"
+}
+
+nginx_vhosts_validate_single_func() {
+  declare APP="$1" FLAG="$2"
+  local NGINX_CONF="$DOKKU_ROOT/$APP/nginx.conf"
+
+  if [[ ! -f "$NGINX_CONF" ]]; then
+    dokku_log_warn_quiet "No nginx config found for ${APP}"
+    return
+  fi
+
+  if nginx_vhosts_is_valid_nginx_config_func "$APP"; then
+    return
+  fi
+
+  dokku_log_warn "Failed to validate nginx config for ${APP}. Contents below..."
+  cat "$NGINX_CONF"
+
+  if [[ "$FLAG" == "--clean" ]]; then
+    nginx_vhosts_conf_clean_func "$APP"
+  fi
+}
+
+nginx_vhosts_is_valid_nginx_config_func() {
+  declare desc="checks if an app has a valid nginx config"
+  declare APP="$1"
+  local VALIDATE_TEMPLATE="$PLUGIN_AVAILABLE_PATH/nginx-vhosts/templates/validate.conf.sigil"
+  local TMP_OUTPUT=$(mktemp "/tmp/dokku-${DOKKU_PID}-${FUNCNAME[0]}.XXXXXX")
+  trap "rm -rf '$TMP_OUTPUT' >/dev/null" RETURN INT TERM EXIT
+
+  CUSTOM_VALIDATE_TEMPLATE="$(plugn trigger nginx-app-template-source "$APP" "validate-config")"
+  if [[ -n "$CUSTOM_VALIDATE_TEMPLATE" ]]; then
+    VALIDATE_TEMPLATE="$CUSTOM_VALIDATE_TEMPLATE"
+  fi
+
+  sigil -f "$VALIDATE_TEMPLATE" NGINX_CONF="$DOKKU_ROOT/$APP/nginx.conf" | cat -s >"$TMP_OUTPUT"
+  sudo "$NGINX_LOCATION" -t -c "$TMP_OUTPUT" 2>/dev/null
+}
+
+nginx_vhosts_conf_clean_func() {
+  declare APP="$1"
+  local NGINX_CONF="$DOKKU_ROOT/$APP/nginx.conf"
+  dokku_log_warn "Removing invalid nginx file"
+  rm -f "$NGINX_CONF"
+}
+
+nginx_clear_config() {
+  declare desc="Remove the nginx conf file"
+  declare APP="$1"
+  rm -f "$DOKKU_ROOT/$APP/nginx.conf"
+  suppress_output fn-nginx-vhosts-nginx-init-cmd "reload"
+}

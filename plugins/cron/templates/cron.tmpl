@@ -1,0 +1,6 @@
+PATH=/usr/local/bin:/usr/bin:/bin
+SHELL=/bin/bash
+
+{{ range $entry := .Commands -}}
+{{ $entry.Schedule }} {{ $entry.CronCommand }}
+{{ end -}}

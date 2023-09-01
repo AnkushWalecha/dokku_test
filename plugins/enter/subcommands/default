@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+source "$PLUGIN_CORE_AVAILABLE_PATH/common/functions"
+set -eo pipefail
+[[ $DOKKU_TRACE ]] && set -x
+
+cmd-enter-default() {
+  declare desc="enters running app container of specified proc type"
+  declare cmd="enter"
+  [[ "$1" == "$cmd" ]] && shift 1
+  declare APP="$1"
+
+  verify_app_name "$APP"
+
+  local DOKKU_SCHEDULER=$(get_app_scheduler "$APP")
+  plugn trigger scheduler-enter "$DOKKU_SCHEDULER" "$@"
+}
+
+cmd-enter-default "$@"

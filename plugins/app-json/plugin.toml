@@ -1,0 +1,4 @@
+[plugin]
+description = "dokku core app-json plugin"
+version = "0.31.2"
+[plugin.config]

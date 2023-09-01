@@ -1,0 +1,431 @@
+package common
+
+import (
+	"bytes"
+	"errors"
+	"fmt"
+	"io/ioutil"
+	"os"
+	"strings"
+	"time"
+
+	"github.com/codeskyblue/go-sh"
+)
+
+// ContainerIsRunning checks to see if a container is running
+func ContainerIsRunning(containerID string) bool {
+	b, err := DockerInspect(containerID, "'{{.State.Running}}'")
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(string(b[:])) == "true"
+}
+
+// ContainerStart runs 'docker container start' against an existing container
+// whether that container is running or not
+func ContainerStart(containerID string) bool {
+	cmd := sh.Command(DockerBin(), "container", "start", containerID)
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+	if err := cmd.Run(); err != nil {
+		return false
+	}
+
+	return true
+}
+
+// ContainerExists checks to see if a container exists
+func ContainerExists(containerID string) bool {
+	cmd := sh.Command(DockerBin(), "container", "inspect", containerID)
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+	if err := cmd.Run(); err != nil {
+		return false
+	}
+
+	return true
+}
+
+// ContainerWaitTilReady will wait timeout seconds and then check if a container is running
+// returning an error if it is not running at the end of the timeout
+func ContainerWaitTilReady(containerID string, timeout time.Duration) error {
+	time.Sleep(timeout)
+
+	if !ContainerIsRunning(containerID) {
+		return fmt.Errorf("Container %s is not running", containerID)
+	}
+
+	return nil
+}
+
+// CopyFromImage copies a file from named image to destination
+func CopyFromImage(appName string, image string, source string, destination string) error {
+	if !VerifyImage(image) {
+		return fmt.Errorf("Invalid docker image for copying content")
+	}
+
+	workDir := ""
+	if !IsAbsPath(source) {
+		if IsImageCnbBased(image) {
+			workDir = "/workspace"
+		} else if IsImageHerokuishBased(image, appName) {
+			workDir = "/app"
+		} else {
+			workDir, _ = DockerInspect(image, "{{.Config.WorkingDir}}")
+		}
+
+		if workDir != "" {
+			source = fmt.Sprintf("%s/%s", workDir, source)
+		}
+	}
+
+	tmpFile, err := ioutil.TempFile(os.TempDir(), fmt.Sprintf("dokku-%s-%s", MustGetEnv("DOKKU_PID"), "CopyFromImage"))
+	if err != nil {
+		return fmt.Errorf("Cannot create temporary file: %v", err)
+	}
+
+	defer tmpFile.Close()
+	defer os.Remove(tmpFile.Name())
+
+	globalRunArgs := MustGetEnv("DOKKU_GLOBAL_RUN_ARGS")
+	createLabelArgs := []string{"--label", fmt.Sprintf("com.dokku.app-name=%s", appName), globalRunArgs}
+	containerID, err := DockerContainerCreate(image, createLabelArgs)
+	if err != nil {
+		return fmt.Errorf("Unable to create temporary container: %v", err)
+	}
+
+	// docker cp exits with status 1 when run as non-root user when it tries to chown the file
+	// after successfully copying the file. Thus, we suppress stderr.
+	// ref: https://github.com/dotcloud/docker/issues/3986
+	containerCopyCmd := NewShellCmd(strings.Join([]string{
+		DockerBin(),
+		"container",
+		"cp",
+		fmt.Sprintf("%s:%s", containerID, source),
+		tmpFile.Name(),
+	}, " "))
+	containerCopyCmd.ShowOutput = false
+	fileCopied := containerCopyCmd.Execute()
+
+	containerRemoveCmd := NewShellCmd(strings.Join([]string{
+		DockerBin(),
+		"container",
+		"rm",
+		"--force",
+		containerID,
+	}, " "))
+	containerRemoveCmd.ShowOutput = false
+	containerRemoveCmd.Execute()
+
+	if !fileCopied {
+		return fmt.Errorf("Unable to copy file %s from image", source)
+	}
+
+	fi, err := os.Stat(tmpFile.Name())
+	if err != nil {
+		return err
+	}
+
+	if fi.Size() == 0 {
+		return fmt.Errorf("Unable to copy file %s from image", source)
+	}
+
+	// workaround for CHECKS file when owner is root. seems to only happen when running inside docker
+	dos2unixCmd := NewShellCmd(strings.Join([]string{
+		"dos2unix",
+		"-l",
+		"-n",
+		tmpFile.Name(),
+		destination,
+	}, " "))
+	dos2unixCmd.ShowOutput = false
+	dos2unixCmd.Execute()
+
+	// add trailing newline for certain places where file parsing depends on it
+	b, err := sh.Command("tail", "-c1", destination).Output()
+	if string(b) != "" {
+		f, err := os.OpenFile(destination, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		if _, err := f.WriteString("\n"); err != nil {
+			return fmt.Errorf("Unable to append trailing newline to copied file: %v", err)
+		}
+	}
+
+	return nil
+}
+
+// DockerBin returns a string which contains a path to the current docker binary
+func DockerBin() string {
+	dockerBin := os.Getenv("DOCKER_BIN")
+	if dockerBin == "" {
+		dockerBin = "docker"
+	}
+
+	return dockerBin
+}
+
+// DockerCleanup cleans up all exited/dead containers and removes all dangling images
+func DockerCleanup(appName string, forceCleanup bool) error {
+	if !forceCleanup {
+		skipCleanup := false
+		if appName != "" {
+			triggerName := "config-get"
+			triggerArgs := []string{appName, "DOKKU_SKIP_CLEANUP"}
+			if appName == "--global" {
+				triggerName = "config-get-global"
+				triggerArgs = []string{"DOKKU_SKIP_CLEANUP"}
+			}
+
+			b, _ := PlugnTriggerOutput(triggerName, triggerArgs...)
+			output := strings.TrimSpace(string(b[:]))
+			if output == "true" {
+				skipCleanup = true
+			}
+		}
+
+		if skipCleanup || os.Getenv("DOKKU_SKIP_CLEANUP") == "true" {
+			LogInfo1("DOKKU_SKIP_CLEANUP set. Skipping dokku cleanup")
+			return nil
+		}
+	}
+
+	LogInfo1("Cleaning up...")
+	if appName == "--global" {
+		appName = ""
+	}
+
+	// delete all non-running and dead containers
+	exitedContainerIDs, _ := listContainers("exited", appName)
+	deadContainerIDs, _ := listContainers("dead", appName)
+	containerIDs := append(exitedContainerIDs, deadContainerIDs...)
+
+	if len(containerIDs) > 0 {
+		DockerRemoveContainers(containerIDs)
+	}
+
+	// delete dangling images
+	imageIDs, _ := ListDanglingImages(appName)
+	if len(imageIDs) > 0 {
+		RemoveImages(imageIDs)
+	}
+
+	if appName != "" {
+		// delete unused images
+		pruneUnusedImages(appName)
+	}
+
+	return nil
+}
+
+// DockerContainerCreate creates a new container and returns the container ID
+func DockerContainerCreate(image string, containerCreateArgs []string) (string, error) {
+	cmd := []string{
+		DockerBin(),
+		"container",
+		"create",
+	}
+
+	cmd = append(cmd, containerCreateArgs...)
+	cmd = append(cmd, image)
+
+	var stderr bytes.Buffer
+	containerCreateCmd := NewShellCmd(strings.Join(cmd, " "))
+	containerCreateCmd.ShowOutput = false
+	containerCreateCmd.Command.Stderr = &stderr
+	b, err := containerCreateCmd.Output()
+	if err != nil {
+		return "", errors.New(strings.TrimSpace(stderr.String()))
+	}
+
+	return strings.TrimSpace(string(b[:])), nil
+}
+
+// DockerInspect runs an inspect command with a given format against a container or image ID
+func DockerInspect(containerOrImageID, format string) (output string, err error) {
+	b, err := sh.Command(DockerBin(), "inspect", "--format", format, containerOrImageID).Output()
+	if err != nil {
+		return "", err
+	}
+	output = strings.TrimSpace(string(b[:]))
+	if strings.HasPrefix(output, "'") && strings.HasSuffix(output, "'") {
+		output = strings.TrimSuffix(strings.TrimPrefix(output, "'"), "'")
+	}
+	return
+}
+
+// IsImageCnbBased returns true if app image is based on cnb
+func IsImageCnbBased(image string) bool {
+	if len(image) == 0 {
+		return false
+	}
+
+	output, err := DockerInspect(image, "{{index .Config.Labels \"io.buildpacks.stack.id\" }}")
+	if err != nil {
+		return false
+	}
+	return output != ""
+}
+
+// IsImageHerokuishBased returns true if app image is based on herokuish
+func IsImageHerokuishBased(image string, appName string) bool {
+	if len(image) == 0 {
+		return false
+	}
+
+	if IsImageCnbBased(image) {
+		return true
+	}
+
+	dokkuAppUser := ""
+	if len(appName) != 0 {
+		b, err := PlugnTriggerOutput("config-get", []string{appName, "DOKKU_APP_USER"}...)
+		if err == nil {
+			dokkuAppUser = strings.TrimSpace(string(b))
+		}
+	}
+
+	if len(dokkuAppUser) == 0 {
+		dokkuAppUser = "herokuishuser"
+	}
+
+	output, err := DockerInspect(image, fmt.Sprintf("{{range .Config.Env}}{{if eq . \"USER=%s\" }}{{println .}}{{end}}{{end}}", dokkuAppUser))
+	if err != nil {
+		return false
+	}
+	return output != ""
+}
+
+// ListDanglingImages lists all dangling image ids for a given app
+func ListDanglingImages(appName string) ([]string, error) {
+	command := []string{
+		DockerBin(),
+		"image",
+		"ls",
+		"--quiet",
+		"--filter",
+		"dangling=true",
+	}
+
+	if appName != "" {
+		command = append(command, []string{"--filter", fmt.Sprintf("label=com.dokku.app-name=%v", appName)}...)
+	}
+
+	var stderr bytes.Buffer
+	listCmd := NewShellCmd(strings.Join(command, " "))
+	listCmd.ShowOutput = false
+	listCmd.Command.Stderr = &stderr
+	b, err := listCmd.Output()
+
+	if err != nil {
+		return []string{}, errors.New(strings.TrimSpace(stderr.String()))
+	}
+
+	output := strings.Split(strings.TrimSpace(string(b[:])), "\n")
+	return output, nil
+}
+
+// RemoveImages removes images by ID
+func RemoveImages(imageIDs []string) {
+	if len(imageIDs) == 0 {
+		return
+	}
+
+	command := []string{
+		DockerBin(),
+		"image",
+		"rm",
+	}
+
+	command = append(command, imageIDs...)
+
+	var stderr bytes.Buffer
+	rmCmd := NewShellCmd(strings.Join(command, " "))
+	rmCmd.ShowOutput = false
+	rmCmd.Command.Stderr = &stderr
+	rmCmd.Execute()
+}
+
+// VerifyImage returns true if docker image exists in local repo
+func VerifyImage(image string) bool {
+	imageCmd := NewShellCmd(strings.Join([]string{DockerBin(), "image", "inspect", image}, " "))
+	imageCmd.ShowOutput = false
+	return imageCmd.Execute()
+}
+
+// DockerFilterContainers returns a slice of container IDs based on the passed in filters
+func DockerFilterContainers(filters []string) ([]string, error) {
+	command := []string{
+		DockerBin(),
+		"container",
+		"ls",
+		"--quiet",
+		"--all",
+	}
+
+	for _, filter := range filters {
+		command = append(command, "--filter", filter)
+	}
+
+	var stderr bytes.Buffer
+	listCmd := NewShellCmd(strings.Join(command, " "))
+	listCmd.ShowOutput = false
+	listCmd.Command.Stderr = &stderr
+	b, err := listCmd.Output()
+
+	if err != nil {
+		return []string{}, errors.New(strings.TrimSpace(stderr.String()))
+	}
+
+	output := strings.Split(strings.TrimSpace(string(b[:])), "\n")
+	return output, nil
+}
+
+func listContainers(status string, appName string) ([]string, error) {
+	filters := []string{
+		fmt.Sprintf("status=%v", status),
+		fmt.Sprintf("label=%v", os.Getenv("DOKKU_CONTAINER_LABEL")),
+	}
+
+	if appName != "" {
+		filters = append(filters, fmt.Sprintf("label=com.dokku.app-name=%v", appName))
+	}
+	return DockerFilterContainers(filters)
+}
+
+func pruneUnusedImages(appName string) {
+	command := []string{
+		DockerBin(),
+		"image",
+		"prune",
+		"--all",
+		"--force",
+		"--filter",
+		fmt.Sprintf("label=com.dokku.app-name=%v", appName),
+	}
+
+	var stderr bytes.Buffer
+	pruneCmd := NewShellCmd(strings.Join(command, " "))
+	pruneCmd.ShowOutput = false
+	pruneCmd.Command.Stderr = &stderr
+	pruneCmd.Execute()
+}
+
+// DockerRemoveContainers will call `docker container rm` on the specified containers
+func DockerRemoveContainers(containerIDs []string) {
+	command := []string{
+		DockerBin(),
+		"container",
+		"rm",
+	}
+
+	command = append(command, containerIDs...)
+
+	var stderr bytes.Buffer
+	rmCmd := NewShellCmd(strings.Join(command, " "))
+	rmCmd.ShowOutput = false
+	rmCmd.Command.Stderr = &stderr
+	rmCmd.Execute()
+}

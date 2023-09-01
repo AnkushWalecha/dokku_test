@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -eo pipefail
+[[ $DOKKU_TRACE ]] && set -x
+source "$PLUGIN_CORE_AVAILABLE_PATH/common/functions"
+source "$PLUGIN_AVAILABLE_PATH/config/functions"
+
+trigger-nginx-vhosts-pre-enable-vhost() {
+  declare desc="unset port prior to vhosts being enabled"
+  declare trigger="pre-enable-vhost"
+  declare APP="$1"
+
+  if [[ "$(plugn trigger proxy-type "$APP")" == "nginx" ]]; then
+    DOKKU_QUIET_OUTPUT=1 config_unset --no-restart "$APP" DOKKU_PROXY_PORT DOKKU_PROXY_SSL_PORT
+    plugn trigger ports-clear "$APP"
+  fi
+}
+
+trigger-nginx-vhosts-pre-enable-vhost "$@"

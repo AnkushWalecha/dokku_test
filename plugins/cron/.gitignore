@@ -1,0 +1,8 @@
+/commands
+/subcommands/*
+/triggers/*
+/triggers
+/cron-*
+/install
+/post-*
+/report

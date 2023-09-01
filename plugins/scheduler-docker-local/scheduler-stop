@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+set -eo pipefail
+[[ $DOKKU_TRACE ]] && set -x
+source "$PLUGIN_CORE_AVAILABLE_PATH/common/functions"
+source "$PLUGIN_AVAILABLE_PATH/config/functions"
+
+trigger-scheduler-docker-local-scheduler-stop() {
+  declare desc="scheduler-docker-local scheduler-stop plugin trigger"
+  declare trigger="scheduler-stop"
+  declare DOKKU_SCHEDULER="$1" APP="$2" REMOVE_CONTAINERS="$3"
+
+  if [[ "$DOKKU_SCHEDULER" != "docker-local" ]]; then
+    return
+  fi
+
+  local DOKKU_APP_RUNNING_CONTAINER_IDS=$(get_app_running_container_ids "$APP" 2>/dev/null)
+  local DOKKU_DOCKER_STOP_TIMEOUT="$(config_get "$APP" DOKKU_DOCKER_STOP_TIMEOUT || true)"
+
+  [[ -n "$DOKKU_DOCKER_STOP_TIMEOUT" ]] && DOCKER_STOP_TIME_ARG="--time=${DOKKU_DOCKER_STOP_TIMEOUT}"
+
+  if [[ -n "$DOKKU_APP_RUNNING_CONTAINER_IDS" ]]; then
+    # Disable the container restart policy
+    "$DOCKER_BIN" container update --restart=no $DOKKU_APP_RUNNING_CONTAINER_IDS &>/dev/null || true
+
+    "$DOCKER_BIN" container stop $DOCKER_STOP_TIME_ARG $DOKKU_APP_RUNNING_CONTAINER_IDS >/dev/null || true
+  fi
+
+  if [[ "$REMOVE_CONTAINERS" == "true" ]]; then
+    local DOKKU_APP_CIDS=$(get_app_container_ids "$APP")
+
+    if [[ -n "$DOKKU_APP_CIDS" ]]; then
+      for CID in $DOKKU_APP_CIDS; do
+        plugn trigger scheduler-register-retired "$APP" "$CID"
+      done
+
+      "$DOCKER_BIN" container rm --force $DOKKU_APP_CIDS &>/dev/null || true
+    fi
+  fi
+}
+
+trigger-scheduler-docker-local-scheduler-stop "$@"

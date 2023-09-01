@@ -1,0 +1,10 @@
+/commands
+/install
+/post-*
+/pre-*
+/report
+/subcommands/*
+/triggers
+/triggers/*
+/app-json-process-deploy-parallelism
+/core-*
